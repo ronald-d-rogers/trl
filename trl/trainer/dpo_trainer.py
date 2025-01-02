@@ -1143,7 +1143,12 @@ class DPOTrainer(Trainer):
                 num_logits_to_keep = loss_mask.shape[1] - first_compute_index
                 model_kwargs["num_logits_to_keep"] = num_logits_to_keep.item() + 1  # +1 for the first label
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
+            inputs = self._finalize_inputs(input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask)
+            input_ids = inputs["input_ids"]
+            loss_mask = inputs["loss_mask"]
+            del inputs["loss_mask"]
+
+            outputs = model(**inputs, **model_kwargs)
 
             # Offset the logits by one to align with the labels
             logits = outputs.logits[:, :-1, :]
