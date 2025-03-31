@@ -24,13 +24,18 @@ from transformers.utils.import_utils import _is_package_available
 # Use same as transformers.utils.import_utils
 _deepspeed_available = _is_package_available("deepspeed")
 _diffusers_available = _is_package_available("diffusers")
+_fastapi_available = _is_package_available("fastapi")
 _llm_blender_available = _is_package_available("llm_blender")
 _mergekit_available = _is_package_available("mergekit")
+_pydantic_available = _is_package_available("pydantic")
+_requests_available = _is_package_available("requests")
 _rich_available = _is_package_available("rich")
 _unsloth_available = _is_package_available("unsloth")
+_uvicorn_available = _is_package_available("uvicorn")
 _vllm_available = _is_package_available("vllm")
 _langchain_experimental_available = _is_package_available("langchain_experimental")
 _e2b_available = _is_package_available("e2b_code_interpreter")
+_joblib_available = _is_package_available("joblib")
 
 
 def is_deepspeed_available() -> bool:
@@ -41,6 +46,10 @@ def is_diffusers_available() -> bool:
     return _diffusers_available
 
 
+def is_fastapi_available() -> bool:
+    return _fastapi_available
+
+
 def is_llm_blender_available() -> bool:
     return _llm_blender_available
 
@@ -49,12 +58,24 @@ def is_mergekit_available() -> bool:
     return _mergekit_available
 
 
+def is_pydantic_available() -> bool:
+    return _pydantic_available
+
+
+def is_requests_available() -> bool:
+    return _requests_available
+
+
 def is_rich_available() -> bool:
     return _rich_available
 
 
 def is_unsloth_available() -> bool:
     return _unsloth_available
+
+
+def is_uvicorn_available() -> bool:
+    return _uvicorn_available
 
 
 def is_vllm_available() -> bool:
@@ -67,6 +88,10 @@ def is_langchain_experimental_available() -> bool:
 
 def is_e2b_available() -> bool:
     return _e2b_available
+
+
+def is_joblib_available() -> bool:
+    return _joblib_available
 
 
 class _LazyModule(ModuleType):
