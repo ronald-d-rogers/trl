@@ -16,7 +16,7 @@ import argparse
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -296,9 +296,10 @@ def main(script_args: ScriptArguments):
         min_p: float = 0.0
         max_tokens: int = 16
         guided_decoding_regex: Optional[str] = None
+        stop: Optional[list[str]] = None
 
     class GenerateResponse(BaseModel):
-        completion_ids: list[list[int]]
+        completions: list[dict[str, Any]]
 
     @app.post("/generate/", response_model=GenerateResponse)
     async def generate(request: GenerateRequest):
@@ -311,7 +312,9 @@ def main(script_args: ScriptArguments):
 
         Returns:
             `GenerateResponse`:
-                - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
+                - completions (list of `dict`):
+                    - `completion_ids` (list of `int`): A list of token IDs for the generated completion.
+                    - `stop_reason` (str): The reason for stopping the generation (e.g., "eos" for end of sequence).
 
         Example request:
         ```json
@@ -320,7 +323,7 @@ def main(script_args: ScriptArguments):
 
         Example response:
         ```json
-        {"completion_ids": [[101, 102, 103], [201, 202, 203]]}
+        {"completion": [{"completion_ids": [1, 2, 3], "stop_reason": "eos"}, {"completion_ids": [4, 5, 6], "stop_reason": "eos"}]}
         ```
         """
 
@@ -340,10 +343,15 @@ def main(script_args: ScriptArguments):
             min_p=request.min_p,
             max_tokens=request.max_tokens,
             guided_decoding=guided_decoding,
+            stop=request.stop,
         )
-        all_outputs = llm.generate(request.prompts, sampling_params=sampling_params)
-        completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
-        return {"completion_ids": completion_ids}
+        all_outputs = llm.generate(request.prompts, sampling_params=sampling_params, use_tqdm=False)
+        completions = [
+            {"completion_ids": list(output.token_ids), "stop_reason": output.stop_reason}
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
+        return {"completions": completions}
 
     class InitCommunicatorRequest(BaseModel):
         host: str
@@ -415,7 +423,7 @@ def main(script_args: ScriptArguments):
         return {"message": "Request received, closing communicator"}
 
     # Start the server
-    uvicorn.run(app, host=script_args.host, port=script_args.port)
+    uvicorn.run(app, host=script_args.host, port=script_args.port, log_level="warning")
 
     dist.destroy_process_group()
 

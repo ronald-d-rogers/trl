@@ -728,29 +728,31 @@ class GRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                if self.args.use_agent:
-                    self.sampling_params.n = 1  # Agents are incomapatible with n>1 since they generate outputs in multiple steps independantly
-                    outputs = generate_agent_responses(
-                        llm=self.llm,
-                        dataset=all_prompts_text,
-                        sampling_params=self.sampling_params,
-                        code_executer=self.code_executer,
-                        tools_script_path=self.args.tools_script_path,
-                        parsing_string=self.args.parsing_string,
-                        stop_string=self.args.stop_string,
-                    )
-                    # parsing and tokenizing the completion since outputs with use_agent is the full chat
-                    completion_ids = [
-                        tuple(self.processing_class.encode(output[len(prompt) :].strip(), add_special_tokens=False))
-                        for prompt, output in zip(all_prompts_text, outputs)
-                    ]
-                else:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
-                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
-                    with profiling_context(self, "vLLM.generate"):
-                        completion_ids = self.vllm_client.generate(
+                with profiling_context(self, "vLLM.generate"):
+                    if self.args.use_agent:
+                        completion_ids = generate_agent_responses(
+                            client=self.vllm_client,
+                            processing_class=self.processing_class,
+                            dataset=all_prompts_text,
+                            n=1,  # Agents are incomapatible with n>1 since they generate outputs in multiple steps independantly
+                            repetition_penalty=self.repetition_penalty,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=-1 if self.top_k is None else self.top_k,
+                            min_p=0.0 if self.min_p is None else self.min_p,
+                            max_tokens=self.max_completion_length,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                            code_executer=self.code_executer,
+                            tools_script_path=self.args.tools_script_path,
+                            parsing_string=self.args.parsing_string,
+                            stop_string=self.args.stop_string,
+                        )
+                    else:
+                        # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                        # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                        # prompt individually.
+                        ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                        completions = self.vllm_client.generate(
                             prompts=ordered_set_of_prompts,
                             n=self.num_generations,
                             repetition_penalty=self.repetition_penalty,
@@ -761,6 +763,7 @@ class GRPOTrainer(Trainer):
                             max_tokens=self.max_completion_length,
                             guided_decoding_regex=self.guided_decoding_regex,
                         )
+                        completion_ids = [c["completion_ids"] for c in completions]
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its

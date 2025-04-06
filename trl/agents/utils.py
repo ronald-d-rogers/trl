@@ -15,7 +15,16 @@
 import asyncio
 from inspect import getsource
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING, Callable, List, Union
+
+from transformers import (
+    BaseImageProcessor,
+    FeatureExtractionMixin,
+    PreTrainedTokenizerBase,
+    ProcessorMixin,
+)
+
+from trl.extras.vllm_client import VLLMClient
 
 # from dataclasses import dataclass
 # from e2b_code_interpreter import AsyncSandbox
@@ -274,25 +283,52 @@ def prepare_data_for_local_agent(
     return dataset.map(lambda x, idx: {prompt_column: processed_prompts[idx]}, with_indices=True)
 
 
+prompts: list[str]
+
+
 def generate_agent_responses(
     dataset: list,
-    llm: "LLM",
-    sampling_params: "SamplingParams",
+    client: VLLMClient,
+    processing_class: Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin],
+    n: int = 1,
+    repetition_penalty: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    min_p: float = 0.0,
+    max_tokens: int = 16,
+    guided_decoding_regex: str = None,
     tools_script_path: str = None,
     parsing_string: str = "<code>",
     stop_string: str = "</code>",
     code_executer=None,
-) -> list:
+) -> list[dict]:
     """
     Generates responses for the agent with potential code execution.
 
     Args:
         dataset (`list`):
             List of preprocessed prompts (strings).
-        llm (`LLM`):
-            The language model to use for generation.
-        sampling_params (`SamplingParams`):
-            Sampling parameters for the llm.generate method.
+        client (`VLLMClient`):
+            VLLM client for generating responses.
+        processing_class (`PreTrainedTokenizerBase` or `BaseImageProcessor` or `FeatureExtractionMixin` or `ProcessorMixin`, *optional*):
+            Processing class used to encode and decode the prompts and completions.
+        n (`int`, *optional*, defaults to `1`):
+            Number of completions to generate for each prompt.
+        repetition_penalty (`float`, *optional*, defaults to `1.0`):
+            Parameter for repetition penalty. 1.0 means no penalty.
+        temperature (`float`, *optional*, defaults to `1.0`):
+            Temperature parameter for sampling. Higher values increase diversity.
+        top_p (`float`, *optional*, defaults to `1.0`):
+            Top-p sampling parameter.`1.0` means no truncation.
+        top_k (`int`, *optional*, defaults to `-1`):
+            Top-k sampling parameter. `-1` means no truncation.
+        min_p (`float`, *optional*, defaults to `0.0`):
+            Minimum probability for sampling.
+        max_tokens (`int`, *optional*, defaults to `16`):
+            Maximum number of tokens to generate for each prompt.
+        guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+            Regular expression to guide the decoding process.
         tools_script_path (`str` or `None`, *optional*, defaults to `None`):
             Path to script to prepend to code extracted.
         parsing_string (`str`, *optional*, defaults to `"<code>"`):
@@ -310,29 +346,47 @@ def generate_agent_responses(
         code_executer = LocalExecutor()
 
     # adding stop string to sampling params
-    sampling_params.stop = [stop_string]
     # Read the tools script if provided.
     tools_script = read_script(tools_script_path) if tools_script_path else None
 
-    completed_chats = []  # Chats that are fully complete.
+    completions = []  # Chats that are fully complete.
     current_batch = dataset  # Start with your initial batch of prompts.
+    current_indices = list(range(len(dataset)))  # Dataset indices of the current batch.
 
     while current_batch:
         # Generate outputs for the current batch.
-        outputs = llm.generate(current_batch, sampling_params, use_tqdm=False)
+        # outputs = llm.generate(current_batch, sampling_params, use_tqdm=False)
+        outputs = client.generate(
+            current_batch,
+            n=n,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            max_tokens=max_tokens,
+            guided_decoding_regex=guided_decoding_regex,
+            stop=[stop_string],
+        )
         next_batch = []  # To store chats that still need code execution.
+        next_indices = []
         code_batch = []  # To collect code snippets for batch execution
-        conversations = []  # To keep track of conversations for each code
+        conversations: list[str] = []  # To keep track of conversations for each code
 
         # First pass: collect all codes that need execution
-        for output in outputs:
-            conversation = output.prompt + output.outputs[0].text
-            if output.outputs[0].stop_reason == stop_string:
-                code = get_code(conversation, tools_script=tools_script, parsing_string=parsing_string)
+        for i, output in enumerate(outputs):
+            if output["stop_reason"] == stop_string:
+                decoded_text = processing_class.decode(output["completion_ids"])
+                code = get_code(decoded_text, tools_script=tools_script, parsing_string=parsing_string)
                 code_batch.append(code)
-                conversations.append(conversation)
+                next_indices.append(current_indices[i])
+                conversations.append(current_batch[i] + decoded_text)
             else:
-                completed_chats.append(conversation)
+                # remove the prompt from the final completion
+                prompt = dataset[current_indices[i]]
+                completion = current_batch[i][len(prompt) :]
+                encoded_ids = processing_class.encode(completion) + output["completion_ids"]
+                completions.append(encoded_ids)
 
         # Execute all collected codes in one batch
         if code_batch:
@@ -340,10 +394,15 @@ def generate_agent_responses(
 
             # Process results and update conversations
             for conv, result in zip(conversations, executed_results):
-                updated_conversation = conv + f"{stop_string}<output>" + result + "</output>"
+                if result.endswith("\n"):
+                    result = result[:-1]
+                if conv.endswith("\n"):
+                    conv = conv[:-1]
+                updated_conversation = f"{conv}<output>{result}</output>"
                 next_batch.append(updated_conversation)
 
         # Process next batch.
         current_batch = next_batch
+        current_indices = next_indices
 
-    return completed_chats
+    return completions
