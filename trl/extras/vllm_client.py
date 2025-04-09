@@ -70,8 +70,13 @@ class VLLMClient:
         >>> from trl.extras.vllm_client import VLLMClient
         >>> client = VLLMClient()
         >>> client.generate(["Hello, AI!", "Tell me a joke"])
-        [[2980, 498, 1492, 752, 448, 264, 13027, 8645, 30, 358, 2776, 4460, 311, 3270, 264, 2025],
-         [911, 7988, 1251, 382, 3838, 653, 498, 1618, 4325, 879, 2581, 20027, 264, 21428, 30, 362]]
+        {
+            "completion_ids": [
+                [2980, 498, 1492, 752, 448, 264, 13027, 8645, 30, 358, 2776, 4460, 311, 3270, 264, 2025],
+                [911, 7988, 1251, 382, 3838, 653, 498, 1618, 4325, 879, 2581, 20027, 264, 21428, 30, 362]
+            ],
+            "stop_reason": ["eos", "eos"]
+        }
 
         >>> from transformers import AutoModelForCausalLM
         >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
@@ -140,7 +145,8 @@ class VLLMClient:
         min_p: float = 0.0,
         max_tokens: int = 16,
         guided_decoding_regex: Optional[str] = None,
-    ) -> list[list[int]]:
+        stop: Optional[str] = None,
+    ) -> list[dict]:
         """
         Generates model completions for the provided prompts.
 
@@ -163,10 +169,14 @@ class VLLMClient:
                 Maximum number of tokens to generate for each prompt.
             guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
                 Regular expression to guide the decoding process.
+            stop (`str` or `None`, *optional*, defaults to `None`):
+                List of strings that stop the generation when they are generated.
 
         Returns:
-            `list[list[int]]`:
-                List of lists of token IDs representing the model-generated completions for each prompt.
+            `list[dict]`:
+                A list of dictionaries containing the generated completions for each prompt with keys:
+                - `completion_ids` (list of `int`): A list of token IDs for the generated completion.
+                - `stop_reason` (str): The reason for stopping the generation (e.g., "eos" for end of sequence).
         """
         url = f"http://{self.host}:{self.server_port}/generate/"
         response = self.session.post(
@@ -181,10 +191,11 @@ class VLLMClient:
                 "min_p": min_p,
                 "max_tokens": max_tokens,
                 "guided_decoding_regex": guided_decoding_regex,
+                "stop": stop,
             },
         )
         if response.status_code == 200:
-            return response.json()["completion_ids"]
+            return response.json()["completions"]
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
