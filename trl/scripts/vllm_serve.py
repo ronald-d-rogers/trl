@@ -253,6 +253,8 @@ def main(script_args: ScriptArguments):
     if not is_vllm_available():
         raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
 
+    load_format = "bitsandbytes" if script_args.quantization == "bitsandbytes" else "auto"
+
     llm = LLM(
         model=script_args.model,
         revision=script_args.revision,
@@ -260,6 +262,7 @@ def main(script_args: ScriptArguments):
         gpu_memory_utilization=script_args.gpu_memory_utilization,
         dtype=script_args.dtype,
         quantization=script_args.quantization,
+        load_format=load_format,
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
         # This is particularly useful here because we generate completions from the same prompts.
