@@ -45,8 +45,26 @@ if is_vllm_available():
     from vllm.distributed.utils import StatelessProcessGroup
     from vllm.sampling_params import GuidedDecodingParams
     from vllm.worker.worker import Worker
+    from typing import Optional, Sequence
+    from ..scripts.vllm_patch import (
+        LoRARequest as PatchedLoRARequest,
+        WorkerLoRAManager as PatchedWorkerLoRAManager,
+        LRUCacheWorkerLoRAManager as PatchedLRUCacheWorkerLoRAManager,
+    )
+    import vllm.lora.request
+
+    vllm.lora.request.LoRARequest = PatchedLoRARequest
+    import vllm.lora.worker_manager
+
+    vllm.lora.worker_manager.LoRARequest = PatchedLoRARequest
+    vllm.lora.worker_manager.WorkerLoRAManager = PatchedWorkerLoRAManager
+    vllm.lora.worker_manager.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
 else:
     Worker = object
+
+
+from trl import TrlParser
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +72,9 @@ logger = logging.getLogger(__name__)
 # error: RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use
 # the 'spawn' start method
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+
+from vllm.lora.request import LoRARequest
 
 
 class WeightSyncWorker(Worker):
@@ -76,6 +97,9 @@ class WeightSyncWorker(Worker):
         # The following attributes are initialized when `init_communicator` method is called.
         self.pynccl_comm = None  # Communicator for weight updates
         self.client_rank = None  # Source rank for broadcasting updated weights
+        self.lora_weight = {}
+        self.lora_requests = None
+        self.lora_id = 0
 
     def init_communicator(self, host: str, port: int, world_size: int) -> None:
         """
@@ -132,6 +156,33 @@ class WeightSyncWorker(Worker):
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
+        # Explicitly delete the temporary weight tensor to free up memory.
+        del weight
+
+    def update_lora_param(self, name: str, dtype: torch.dtype, shape: Sequence[int]) -> None:
+        """
+        Receives updated weights from the client process and updates the named parameter in the model.
+
+        Args:
+            name (`str`):
+                Name of the weight tensor being updated.
+            dtype (`torch.dtype`):
+                Data type of the weight tensor (e.g., `torch.float32`).
+            shape (`Sequence[int]`):
+                Shape of the weight tensor.
+        """
+        if self.pynccl_comm is None:
+            raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
+
+        # Allocate memory for the incoming weight tensor on the correct device.
+        weight = torch.empty(shape, dtype=dtype, device=self.device)
+
+        # Use NCCL to broadcast the updated weights from the client (src) to all workers.
+        self.pynccl_comm.broadcast(weight, src=self.client_rank, stream=torch.cuda.current_stream())
+
+        # Load the received weights into the model.
+        self.lora_weight[name] = weight
+
     def close_communicator(self) -> None:
         """
         Closes the communicator when weight synchronization is no longer needed.
@@ -185,6 +236,7 @@ class ScriptArguments:
         default=None,
         metadata={"help": "Revision to use for the model. If not specified, the default branch will be used."},
     )
+    quantization: str = field(default=None, metadata={"help": "Quantization method."})
     tensor_parallel_size: int = field(
         default=1,
         metadata={"help": "Number of tensor parallel workers to use."},
@@ -261,6 +313,8 @@ def main(script_args: ScriptArguments):
         tensor_parallel_size=script_args.tensor_parallel_size,
         gpu_memory_utilization=script_args.gpu_memory_utilization,
         dtype=script_args.dtype,
+        enable_lora=True,
+        max_lora_rank=32,
         quantization=script_args.quantization,
         load_format=load_format,
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
@@ -337,7 +391,7 @@ def main(script_args: ScriptArguments):
         {"completion": [{"completion_ids": [1, 2, 3], "stop_reason": "eos"}, {"completion_ids": [4, 5, 6], "stop_reason": "eos"}]}
         ```
         """
-
+        worker = llm.llm_engine.model_executor.driver_worker
         # Guided decoding, if enabled
         if request.guided_decoding_regex is not None:
             guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
@@ -356,7 +410,14 @@ def main(script_args: ScriptArguments):
             guided_decoding=guided_decoding,
             stop=request.stop,
         )
-        all_outputs = llm.generate(request.prompts, sampling_params=sampling_params, use_tqdm=False)
+
+        if worker.lora_requests:
+            all_outputs = llm.generate(
+                request.prompts, sampling_params=sampling_params, lora_request=worker.lora_requests, use_tqdm=False
+            )
+        else:
+            all_outputs = llm.generate(request.prompts, sampling_params=sampling_params, use_tqdm=False)
+
         completions = [
             {"completion_ids": list(output.token_ids), "stop_reason": output.stop_reason}
             for outputs in all_outputs
@@ -388,6 +449,25 @@ def main(script_args: ScriptArguments):
         )
         return {"message": "Request received, initializing communicator"}
 
+    class ApplyLoraRequest(BaseModel):
+        lora_config: dict
+
+    @app.post("/apply_lora/")
+    async def apply_lora(request: ApplyLoraRequest, background_tasks: BackgroundTasks):
+        worker = llm.llm_engine.model_executor.driver_worker
+        lora_weights = worker.lora_weight
+        lora_config = request.lora_config
+
+        lora_request = LoRARequest(
+            lora_name=str(worker.lora_id),
+            lora_int_id=worker.lora_id,
+            lora_tensors=lora_weights,
+            lora_config=lora_config,
+        )
+        worker.lora_id = worker.lora_id + 1
+        worker.lora_requests = lora_request
+        return {"message": f"LoRA applied with ID: {worker.lora_id}", "lora_id": worker.lora_id}
+
     class UpdateWeightsRequest(BaseModel):
         name: str
         dtype: str
@@ -414,7 +494,29 @@ def main(script_args: ScriptArguments):
         # background_tasks.add_task(llm.collective_rpc, "update_named_param", args=("name", torch.float32, (10, 10)))
         dtype = torch.__getattribute__(request.dtype.split(".")[-1])
         background_tasks.add_task(llm.collective_rpc, "update_named_param", args=(request.name, dtype, request.shape))
+        return {"message": "Request received, updating named parameter"}
 
+    @app.post("/update_lora_param/")
+    async def update_lora_param(request: UpdateWeightsRequest, background_tasks: BackgroundTasks):
+        """
+        Updates the model weights with the provided tensor.
+
+        Once this endpoint is called, the client process should broadcast the updated weights to all server workers.
+
+        Args:
+            request (`UpdateWeightsRequest`):
+                - `name` (`str`): Name of the weight tensor being updated.
+                - `dtype` (`str`): Data type of the weight tensor (e.g., `"torch.float32"`).
+                - `shape` (list of `int`): Shape of the weight
+
+        """
+        # The function is called this way: update_named_param(name="name", dtype=torch.float32, shape=(10, 10))
+        # So with collect_rpc we need to call it this way:
+        # llm.collective_rpc("update_named_param", args=("name", torch.float32, (10, 10)))
+        # And with background_tasks.add_task we need to call it this way:
+        # background_tasks.add_task(llm.collective_rpc, "update_named_param", args=("name", torch.float32, (10, 10)))
+        dtype = torch.__getattribute__(request.dtype.split(".")[-1])
+        background_tasks.add_task(llm.collective_rpc, "update_lora_param", args=(request.name, dtype, request.shape))
         return {"message": "Request received, updating named parameter"}
 
     @app.post("/reset_prefix_cache/")

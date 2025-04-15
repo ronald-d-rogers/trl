@@ -18,6 +18,7 @@ import time
 from typing import Optional
 
 import torch
+from peft import LoraConfig
 from torch import nn
 
 from ..import_utils import is_requests_available, is_vllm_available
@@ -199,6 +200,65 @@ class VLLMClient:
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
+    def lora_generate(
+        self,
+        prompts: list[str],
+        n: int = 1,
+        repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        min_p: float = 0.0,
+        max_tokens: int = 16,
+        guided_decoding_regex: Optional[str] = None,
+    ) -> list[str]:
+        """
+        Generates model completions for the provided prompts.
+
+        Args:
+            prompts (`list[str]`):
+                List of text prompts for which the model will generate completions.
+            n (`int`, *optional*, defaults to `1`):
+                Number of completions to generate for each prompt.
+            repetition_penalty (`float`, *optional*, defaults to `1.0`):
+                Parameter for repetition penalty. 1.0 means no penalty.
+            temperature (`float`, *optional*, defaults to `1.0`):
+                Temperature parameter for sampling. Higher values increase diversity.
+            top_p (`float`, *optional*, defaults to `1.0`):
+                Top-p sampling parameter.`1.0` means no truncation.
+            top_k (`int`, *optional*, defaults to `-1`):
+                Top-k sampling parameter. `-1` means no truncation.
+            min_p (`float`, *optional*, defaults to `0.0`):
+                Minimum probability for sampling.
+            max_tokens (`int`, *optional*, defaults to `16`):
+                Maximum number of tokens to generate for each prompt.
+            guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+                Regular expression to guide the decoding process.
+
+        Returns:
+            `list[list[int]]`:
+                List of lists of token IDs representing the model-generated completions for each prompt.
+        """
+        url = f"http://{self.host}:{self.server_port}/lora_generate/"
+        response = self.session.post(
+            url,
+            json={
+                "prompts": prompts,
+                "n": n,
+                "repetition_penalty": repetition_penalty,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "max_tokens": max_tokens,
+                "guided_decoding_regex": guided_decoding_regex,
+            },
+        )
+        if response.status_code == 200:
+            return response.json()["completion_ids"]
+        else:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
     def init_communicator(self):
         """
         Initializes the weight update group in a distributed setup for model synchronization.
@@ -256,6 +316,50 @@ class VLLMClient:
         for name, param in model.named_parameters():
             # Update each parameter individually
             self.update_named_param(name, param.data)
+
+    def update_lora_tensor_param(self, name: str, weights: torch.Tensor):
+        """
+        Updates a specific named parameter in the model and broadcasts it to other processes.
+
+        Args:
+            name (`str`):
+                Name of the layer whose weights are being updated.
+            weights (`torch.Tensor`):
+                Tensor containing the updated weights.
+        """
+        dtype, shape = str(weights.dtype), tuple(weights.shape)
+        url = f"http://{self.host}:{self.server_port}/update_lora_param/"
+        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
+        if response.status_code != 200:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+        # Broadcast the weights to the other processes
+        self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
+        self.pynccl_comm.group.barrier()
+
+    def update_lora_params(self, model: nn.Module, config: LoraConfig):
+        """
+        Updates all parameters of the given model by calling `update_named_param` for each parameter in the model.
+
+        Args:
+            model (`nn.Module`):
+                Model whose parameters (weights/biases) are to be updated.
+        """
+        state_dict = model.state_dict()
+        state_dict = {
+            k.replace(".default", ""): v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k
+        }
+        for name, param in state_dict.items():
+            self.update_lora_tensor_param(name, param.data)
+        self.apply_lora(config)
+
+    def apply_lora(self, config: LoraConfig):
+        url = f"http://{self.host}:{self.server_port}/apply_lora/"
+        config_dict = config.to_dict()
+        for key, value in config_dict.items():
+            if isinstance(value, set):
+                config_dict[key] = list(value)
+        response = self.session.post(url, json={"lora_config": config_dict})
 
     def reset_prefix_cache(self):
         """
