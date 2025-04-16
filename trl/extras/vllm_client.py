@@ -18,6 +18,7 @@ import time
 from typing import Optional
 
 import torch
+from peft import LoraConfig
 from torch import nn
 
 from ..import_utils import is_requests_available, is_vllm_available
@@ -256,6 +257,49 @@ class VLLMClient:
         for name, param in model.named_parameters():
             # Update each parameter individually
             self.update_named_param(name, param.data)
+
+    def update_lora_tensor_param(self, name: str, weights: torch.Tensor):
+        """
+        Updates a specific named parameter in the model and broadcasts it to other processes.
+
+        Args:
+            name (`str`):
+                Name of the layer whose weights are being updated.
+            weights (`torch.Tensor`):
+                Tensor containing the updated weights.
+        """
+        dtype, shape = str(weights.dtype), tuple(weights.shape)
+        url = f"http://{self.host}:{self.server_port}/update_lora_param/"
+        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
+        if response.status_code != 200:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+        # Broadcast the weights to the other processes
+        self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
+
+    def update_lora_params(self, model: nn.Module, config: LoraConfig):
+        """
+        Updates all parameters of the given model by calling `update_named_param` for each parameter in the model.
+
+        Args:
+            model (`nn.Module`):
+                Model whose parameters (weights/biases) are to be updated.
+        """
+        state_dict = model.state_dict()
+        state_dict = {
+            k.replace(".default", ""): v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k
+        }
+        for name, param in state_dict.items():
+            self.update_lora_tensor_param(name, param.data)
+        self.apply_lora(config)
+
+    def apply_lora(self, config: LoraConfig):
+        url = f"http://{self.host}:{self.server_port}/apply_lora/"
+        config_dict = config.to_dict()
+        for key, value in config_dict.items():
+            if isinstance(value, set):
+                config_dict[key] = list(value)
+        self.session.post(url, json={"lora_config": config_dict})
 
     def reset_prefix_cache(self):
         """

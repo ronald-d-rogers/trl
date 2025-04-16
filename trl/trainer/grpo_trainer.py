@@ -69,7 +69,7 @@ if is_deepspeed_available():
     import deepspeed
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model
+    from peft import PeftConfig, get_peft_model, get_peft_config
 
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
@@ -305,6 +305,11 @@ class GRPOTrainer(Trainer):
             model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
+
+        if peft_config:
+            self.lora_config = peft_config
+        elif is_peft_model(model):
+            self.lora_config = model.peft_config["default"]
 
         # Models
         # Trained model
@@ -717,41 +722,29 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
 
     @profiling_decorator
+    def _move_lora_to_vllm(self):
+        # For DeepSpeed ZeRO-3, we need to gather all parameters before operations
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+        gather_if_zero3 = deepspeed.zero.GatheredParameters if zero_stage_3 else nullcontext
+        with gather_if_zero3(list(self.model.parameters())):
+            if self.accelerator.is_main_process:
+                self.vllm_client.update_lora_params(self.model, self.lora_config)
+
+        # Reset cache on main process
+        if self.accelerator.is_main_process:
+            self.vllm_client.reset_prefix_cache()
+
+    @profiling_decorator
     def _move_model_to_vllm(self):
         # For DeepSpeed ZeRO-3, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         gather_if_zero3 = deepspeed.zero.GatheredParameters if zero_stage_3 else nullcontext
-
-        if is_peft_model(self.model):
-            # With PEFT and DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as merging
-            # adapters in a sharded manner is not supported.
-            with gather_if_zero3(list(self.model.parameters())):
-                self.model.merge_adapter()
-
-                # Update vLLM weights while parameters are gathered
-                for name, param in self.model.named_parameters():
-                    # When using PEFT, we need to recover the original parameter name and discard some parameters
-                    name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                    if self.model.prefix in name:
-                        continue
-                    # When module to save, remove its prefix and discard the original module
-                    if "original_module" in name:
-                        continue
-                    name = name.replace("modules_to_save.default.", "")
-
-                    if self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
-
-                # Unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
-                # Parameters will automatically be repartitioned when exiting the context
-        else:
-            # For non-PEFT models, simply gather and update each parameter individually.
-            for name, param in self.model.named_parameters():
-                with gather_if_zero3([param]):
-                    if self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
+        for name, param in self.model.named_parameters():
+            with gather_if_zero3([param]):
+                if self.accelerator.is_main_process:
+                    self.vllm_client.update_named_param(name, param.data)
 
         # Reset cache on main process
         if self.accelerator.is_main_process:
@@ -795,7 +788,10 @@ class GRPOTrainer(Trainer):
         if self.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
+                if is_peft_model(self.model):
+                    self._move_lora_to_vllm()
+                else:
+                    self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
