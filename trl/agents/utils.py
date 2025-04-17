@@ -64,6 +64,8 @@ def get_code(chat: str, tools_script: str = None, parsing_string: str = "<code>"
     code = chat.split(parsing_string)[-1]
     if tools_script:
         code = f"{tools_script}\n{code}"
+    if code.endswith("</code>"):
+        code = code[: -len("</code>")]
     return code
 
 
