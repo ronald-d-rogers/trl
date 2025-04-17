@@ -45,7 +45,7 @@ default_system_prompt = "You can answer questions and solve problems. If running
 default_environment_prompt = "This is a user-provided script containing tools that you can use to help complete tasks. It will be added to the sandbox environment so you can call its functions. If you are unsure how to use the available tools, you can use the `help()` function to inspect them."
 
 
-def get_code(chat: str, tools_script: str = None, parsing_string: str = "<code>") -> str:
+def get_code(chat: str, tools_script: str = None, parsing_string: str = "<code>", stop_string: str = "</code>") -> str:
     """
     Extracts and optionally prepends a tools script to a code snippet from a chat message.
 
@@ -64,8 +64,8 @@ def get_code(chat: str, tools_script: str = None, parsing_string: str = "<code>"
     code = chat.split(parsing_string)[-1]
     if tools_script:
         code = f"{tools_script}\n{code}"
-    if code.endswith("</code>"):
-        code = code[: -len("</code>")]
+    if stop_string in code:
+        code = code.split(stop_string)[0]
     return code
 
 
@@ -379,7 +379,9 @@ def generate_agent_responses(
         for i, output in enumerate(outputs):
             if output["stop_reason"] == stop_string:
                 decoded_text = processing_class.decode(output["completion_ids"])
-                code = get_code(decoded_text, tools_script=tools_script, parsing_string=parsing_string)
+                code = get_code(
+                    decoded_text, tools_script=tools_script, parsing_string=parsing_string, stop_string=stop_string
+                )
                 code_batch.append(code)
                 next_indices.append(current_indices[i])
                 conversations.append(current_batch[i] + decoded_text)
