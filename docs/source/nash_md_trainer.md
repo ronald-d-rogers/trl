@@ -51,9 +51,9 @@ accelerate launch train_nash_md.py
 
 Distributed across 8 GPUs, the training takes approximately 3 hours.
 
-To see how the [trained model](https://huggingface.co/trl-lib/Qwen2-0.5B-NashMD) performs, you can use the [TRL Chat CLI](clis#chat-interface).
+To see how the [trained model](https://huggingface.co/trl-lib/Qwen2-0.5B-NashMD) performs, you can use the [Transformers Chat CLI](https://huggingface.co/docs/transformers/quicktour#chat-with-text-generation-models).
 
-<pre><code>$ trl chat --model_name_or_path trl-lib/Qwen2-0.5B-NashMD
+<pre><code>$ transformers-cli chat --model_name_or_path trl-lib/Qwen2-0.5B-NashMD
 <strong><span style="color: red;">&lt;quentin_gallouedec&gt;:</span></strong>
 What is the best programming language?
 
@@ -111,7 +111,7 @@ trainer.add_callback(completions_callback)
 
 This callback logs the model's generated completions directly to Weights & Biases.
 
-![Logged Completions](https://huggingface.co/datasets/trl-internal-testing/example-images/resolve/main/images/wandb_completions.png)
+![Logged Completions](https://huggingface.co/datasets/trl-lib/documentation-images/resolve/main/wandb_completions.png)
 
 ## Example script
 
